@@ -1,33 +1,126 @@
-
 # -*- coding: utf-8 -*- 
 
-# Character Language Model с использованием RNN (LSTM)
-# Вариант с TimeDistributedDense
-# Входной корпус - "Евгений Онегин" с удаленными номерами глав и т.п.
-# (c) kelijah 2016
+''' Character Language Model с использованием RNN (LSTM) библиотеки keras
+
+ Входной корпус - "Евгений Онегин" с удаленными номерами глав и т.п.
+ Файл с корпусом лежит рядом с исходником.
+
+ Модель учится предсказывать следующий символ в предложении.
+ Корпус разбиваем на строфы. Каждая строфа превращается в одну входную
+ цепочку, символ \n задает границы строк в строфе.
+ 
+ В режиме генерации модель дает вероятности для каждого из символов
+ в следующей позиции.
+ 
+ (c) kelijah 2016
+''' 
 
 import os
 import numpy
 import random
 import copy
+import sys
 
 from keras.models import Sequential
 from keras.layers import Dense, Dropout, Activation, TimeDistributedDense
 from keras.layers.recurrent import SimpleRNN
 from keras.layers.recurrent import LSTM
 from keras.optimizers import SGD
+import keras.callbacks
 
-# Путь к текстовому файлу. Каждая строка этого файла содержит одно предложение.
-chars_path =  os.path.expanduser('ЕвгенийОнегин.txt');
+# Путь к текстовому файлу, на котором модель обучается.
+chars_path = 'ЕвгенийОнегин.txt'
+
+START_CHAR = u'\b'
+END_CHAR = u'\t'
+
+# спецсимвол для выравнивания длины предложений.
+SENTINEL_CHAR = u'\a'
+
+
+# вызывается в конце каждой эпохи и выполняет генерацию текста
+class TextGenerator(keras.callbacks.Callback):
+
+    # в этот файл будем записывать генерируемые моделью строки
+    output_samples_path = 'samples.txt'
+
+    def __init__(self,id2char,model):
+        self.id2char = id2char
+        self.model = model
+
+    def on_train_begin(self, logs={}):
+        self.epoch = 0
+        # удалим тексты, сгенерированные в предыдущих запусках скрипта
+        if os.path.isfile(self.output_samples_path):
+            os.remove(self.output_samples_path)
+
+    # helper function to sample an index from a probability array
+    # взято из https://github.com/fchollet/keras/blob/master/examples/lstm_text_generation.py
+    def sample( self, a, temperature=1.0):
+        a = numpy.log(a) / temperature
+        a = numpy.exp(a) / numpy.sum(numpy.exp(a))
+        return numpy.argmax(numpy.random.multinomial(1, a, 1))
+
+
+    def on_epoch_end(self, batch, logs={}):
+        self.epoch = self.epoch+1
+        if (self.epoch%10)==0:
+            with open( self.output_samples_path, 'a' ) as fsamples:
+                        
+                fsamples.write( u'\n' + '='*50 + '\nepoch=' + str(self.epoch) + u'\n' )
+                        
+                # генерируем по 4 цепочки (строфы) для нескольких температур
+                for temp in [0.3, 0.6, 0.9, 1.0, 1.1]:
+                    for igener in range(0,4):
+                        # сделаем сэмплинг цепочки символов
+                        # начинаем всегда с символа <s>
+                        last_char = START_CHAR
+                        self.model.reset_states();
+                                
+                        # буфер для накопления сгенерированной строки
+                        sample_str = u''
+                        sample_seq = last_char
+                            
+                        while len(sample_str)<300:
+                
+                            xlen = len(sample_seq)
+                            X_gener = numpy.zeros( (1,xlen,input_size) )
+                                
+                            for itime,uch in enumerate( list( sample_seq ) ):
+                                X_gener[0,itime,:] = char2vector[ uch ]
+                            
+                            # получаем результат - цепочка предсказаний, из которой нам нужен только
+                            # последний вектор
+                            Y_gener = self.model.predict( X_gener, batch_size=1, verbose=0 )[0,:]
+                            yv = Y_gener[xlen-1,:]
+    
+                            selected_index = self.sample( yv, temp )
+                            selected_char = id2char[selected_index]
+    
+                            if selected_char==END_CHAR:
+                                break
+                                
+                            sample_str = sample_str + selected_char
+                            sample_seq = sample_seq + selected_char
+                            last_char = selected_char
+                                    
+                        print 'sample t=', temp,  ' str=', sample_str
+                        fsamples.write( '\nt=' + str(temp) + '\n\n' )
+                        fsamples.write( sample_str.encode('utf-8') + '\n' )
+
+
+
+
+
+
 
 print 'Reading char sequences from ', chars_path
 
 chars_set = set() # список встретившихся символов без повтора
-id2char = {} # для получения символа по его индексу
 
-# токены начала и конца цепочки добавляем руками, так как в явном виде их в корпусе нет
-chars_set.add( '\r' ) # <s> начало
-chars_set.add( '\n' ) # </s> конец
+# токены начала и конца цепочки, а также перевода строки добавляем
+# руками, так как в явном виде их в корпусе нет
+chars_set = set( [SENTINEL_CHAR,START_CHAR, u'\n', END_CHAR] )
 
 with open( chars_path, 'r' ) as f:
     for num,line in enumerate(f):
@@ -36,35 +129,23 @@ with open( chars_path, 'r' ) as f:
 nchar = len(chars_set)
 print 'Number of unique chars=', len(chars_set)
 
-for i,c in enumerate(chars_set):
-    id2char[i] = c
+# для получения символа по его индексу
+id2char = dict( (i,c) for i,c in enumerate(chars_set) ) 
 
-# для отладки: в файл выведем словарь символов
-with open( 'id2char.txt', 'w' ) as ff:
-    for (id,ch) in id2char.iteritems():
-        if ch=='\r':
-            ff.write( str(id) + u' ==> <s>\n' );
-        elif ch=='\n':
-            ff.write( str(id) + u' ==> </s>\n' );
-        else:
-            ff.write( (str(id) + u' ==> ' + ch + u'\n').encode('utf-8') );
-        
-        
 # преобразование символа во входной вектор 0|1's
-# TODO: использовать слой Embedding
 char2vector = {}
 for i,c in enumerate(chars_set):
     v = numpy.zeros(nchar)
-    v[i] = 1
+    if c!=SENTINEL_CHAR:
+        v[i] = 1
     char2vector[c] = v
 
 
+features_size = 150 # кол-во элементов в RNN
+batch_len = 16
+NUMBER_OF_EPOCH = 500 # кол-во повторов тренировки по одному набору данных
 input_size = nchar
-features_size = 100
 output_size = nchar
-batch_len = 64
-NUMBER_OF_EPOCH = 500 # начальное кол-во повторов тренировки по одному набору данных
-
 
 model = Sequential()
 
@@ -85,149 +166,92 @@ print 'Compiling the model...'
 model.compile(loss='categorical_crossentropy', optimizer='rmsprop')
 
 # сохраним архитектуру сети в текстовый файл
-open('model_architecture.json', 'w').write( model.to_json() )
+#open('model_architecture.json', 'w').write( model.to_json() )
 
 print( 'Start training...' )
 
-total_session_count = 0
-total_sample_count = 0
-
-# накапливаем последовательности разной длины в отдельных списках
-len2list_of_seq = {}
-
-# количество накопленных в len2list_of_seq последовательностей
+# количество накопленных в samples последовательностей
 sample_count = 0
 
-# здесь получим макс. длину последовательности символов, которую мы запомнили
+# здесь получим макс. длину последовательности символов без учета добавляемых токенов <s> и </s>
 max_seq_len=0
 
-# в этот файл будем записывать генерируемые моделью строки
-output_samples_path = 'samples.txt'
-if os.path.isfile(output_samples_path):
-    os.remove(output_samples_path)
+# идем по файлу с предложениями, извлекаем сэмплы для обучения
+print u'Loading', chars_path
 
-
-# идем по файлу с предложениями
-print u'Loading Евгений Онегин...'
+endchars = set( u'!;.?' )
+sample_buf = ''
+sample_count=0
+samples = []
 with open( chars_path, 'r' ) as f:
     for line in f:
         charseq = line.strip().decode("utf-8")
-        xlen = len(charseq)
-        if xlen>1:
-            if xlen in len2list_of_seq:
-                len2list_of_seq[xlen].append( charseq )
-            else:
-                len2list_of_seq[xlen] = [ charseq ]
-            sample_count = sample_count+1
-            max_seq_len = max( max_seq_len, xlen )
-
-
-print 'Training...'
+        
+        if len(charseq)>0:
+            if len(sample_buf)>0:
+                sample_buf = sample_buf + u'\n'
+            sample_buf = sample_buf + charseq
             
-isession = 0
+            if len(sample_buf)>0 and sample_buf[-1] in endchars:
+                xlen = len(sample_buf)
+                if xlen>1:
+                    samples.append(sample_buf)
+                    sample_count = sample_count+1
+                    max_seq_len = max( max_seq_len, xlen )
+                sample_buf = ''
+
+print 'sample_count=', sample_count
+
+# из общего числа отберем треть для проверки
+#n_test = int(sample_count*0.3)
+n_test = 0
             
-# группируем последовательности одной длины в сессию
-# сортируем последовательности так, чтобы последней обрабатывалась группа с самым большим числом сэмплов
+# остальное - тренировка
+n_train = sample_count-n_test
             
-for seqlen, n_sequence in sorted( [ (seqlen, len(sequences)) for seqlen, sequences in len2list_of_seq.iteritems() ], key=lambda z : z[1] ):
+xlen = max_seq_len+1            
+            
+# тензоры для входных последовательностей и выходных эталонных данных
+X_train = numpy.zeros( (n_train,xlen,input_size), dtype=numpy.bool )
+Y_train = numpy.zeros( (n_train,xlen,input_size), dtype=numpy.bool )
 
-    if n_sequence>batch_len:
+X_test = numpy.zeros( (n_test,xlen,input_size), dtype=numpy.bool )
+Y_test = numpy.zeros( (n_test,xlen,input_size), dtype=numpy.bool )
 
-        print 'seqlen=', seqlen, 'n_sequence=', n_sequence
+itrain=0;
+itest=0
 
-        xlen = seqlen + 2 -1 # +2 токена <s> и </s> и один токен убираем, чтобы работало предсказание для последнего символа предложения 
-                    
-        # из общего числа отберем треть для проверки
-        n_test = int(n_sequence*0.3)
-                    
-        # остальное - тренировка
-        n_train = n_sequence-n_test
-                    
-        # тензоры для входных последовательностей и выходных эталонных данных
-        X_train = numpy.zeros( (n_train,xlen,input_size) )
-        Y_train = numpy.zeros( (n_train,xlen,input_size) )
 
-        X_test = numpy.zeros( (n_test,xlen,input_size) )
-        Y_test = numpy.zeros( (n_test,xlen,input_size) )
+print 'Vectorization...'            
+# заполняем тензоры
+for isample,rawseq in enumerate(samples):
+    
+    # слева или справа дополняем символами \a, чтобы все последовательности имели одинаковую длину
+    seq = (START_CHAR + rawseq + END_CHAR).rjust(max_seq_len+2,SENTINEL_CHAR)
 
-        # заполняем тензоры
-        itrain=0;
-        itest=0
-        for isample,rawseq in enumerate(len2list_of_seq[seqlen]):
-            seq = '\r' + rawseq + '\n'
-                        
-            is_training = True
-            if itrain>=n_train:
-                is_training = False
-                             
-            for itime in range(0,len(seq)-1):
-                x = seq[itime]
-                y = seq[itime+1]
-                            
-                if is_training:
-                    X_train[itrain,itime,:] = char2vector[ x ]
-                    Y_train[itrain,itime,:] = char2vector[ y ]
-                else:
-                    X_test[itest,itime,:] = char2vector[ x ]
-                    Y_test[itest,itime,:] = char2vector[ y ]
-                        
-            if is_training:        
-                itrain = itrain+1
-            else:    
-                itest = itest+1
+    is_training = True
+    if itrain>=n_train:
+        is_training = False
+                     
+    for itime in range(0,len(seq)-1):
+        x = seq[itime]
+        y = seq[itime+1]
+                    
+        if is_training:
+            X_train[itrain,itime,:] = char2vector[ x ]
+            Y_train[itrain,itime,:] = char2vector[ y ]
+        else:
+            X_test[itest,itime,:] = char2vector[ x ]
+            Y_test[itest,itime,:] = char2vector[ y ]
+                
+    if is_training:        
+        itrain = itrain+1
+    else:    
+        itest = itest+1
 
-        print 'training n_sequence=', n_sequence, 'itrain=', itrain, 'itest=', itest
-        acc = model.fit( X_train, Y_train, batch_size=batch_len, nb_epoch=NUMBER_OF_EPOCH, validation_data=[X_test,Y_test] )
-                    
-        isession = isession+1
-                    
-        with open( output_samples_path, 'a' ) as fsamples:
-                    
-            fsamples.write( '\n\n\nAfter session ' + str(isession) + '/' + str(len(len2list_of_seq)) + ' seqlen=' + str(seqlen) + ' n_sequence=' + str(n_sequence) + ':\n\n' )
+text_generator = TextGenerator(id2char,model)
 
-            for igener in range(0,10):
-                # сделаем сэмплинг цепочки символов
-                # начинаем всегда с символа <s>
-                last_char = u'\r'
-                model.reset_states();
-                        
-                # буфер для накопления сгенерированной строки
-                sample_str = u''
-                sample_seq = last_char
-                    
-                while len(sample_str)<300:
-
-                    xlen = len(sample_seq)
-                    X_gener = numpy.zeros( (1,xlen,input_size) )
-                        
-                    for itime,uch in enumerate( list( sample_seq ) ):
-                        X_gener[0,itime,:] = char2vector[ uch ]
-                    
-                    # получаем результат - цепочка предсказаний, из которой нам нужен только
-                    # последний вектор
-                    Y_gener = model.predict( X_gener, batch_size=1, verbose=0 )[0,:]
-                    yv = Y_gener[xlen-1,:]
-                            
-                    sum_y = numpy.sum(yv) # должно быть ~1, так как softmax
-                            
-                    ch_p = sorted( [(ichar,p/sum_y) for ichar,p in enumerate(yv)], key = lambda z : -z[1] )
-                            
-                    # выбираем новый символ
-                    p = random.random()
-                    sum_p = 0
-                    selected_char = ' '
-                    for (ich,pch) in ch_p:
-                        sum_p = sum_p + pch
-                        if sum_p >= p:
-                            selected_char = id2char[ich]
-                            break
-                            
-                    if selected_char==u'\n':
-                        break
-                        
-                    sample_str = sample_str + selected_char
-                    sample_seq = sample_seq + selected_char
-                    last_char = selected_char
-                            
-                print 'sample_str=', sample_str
-                fsamples.write( sample_str.encode('utf-8') + '\n' )
+print 'training sample_count=', sample_count, 'itrain=', itrain, 'itest=', itest
+#acc = model.fit( X_train, Y_train, batch_size=batch_len, nb_epoch=NUMBER_OF_EPOCH, validation_data=[X_test,Y_test], callbacks=[text_generator] )
+acc = model.fit( X_train, Y_train, batch_size=batch_len, nb_epoch=NUMBER_OF_EPOCH, callbacks=[text_generator] )
+          
