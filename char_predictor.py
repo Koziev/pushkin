@@ -97,7 +97,7 @@ class CharLevelEstimator(object):
 
         # Генерируем батчи из обучающего набора.
         # Перед каждой эпохой тасуем обучающие N-граммы.
-        nb_patterns = 1000000
+        nb_patterns = 2000000
         batch_size = 200
 
         model_checkpoint = ModelCheckpoint(weights_filename, monitor='val_acc', verbose=1,
