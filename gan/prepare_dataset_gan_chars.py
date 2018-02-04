@@ -2,8 +2,6 @@
 
 from __future__ import print_function, division
 
-import gensim
-import codecs
 import os
 import pickle
 import numpy as np
@@ -44,7 +42,7 @@ data = np.zeros((nb_words, max_word_len, nb_chars), dtype='bool')
 for iword, word in enumerate(dict_words):
     word = rpad(word, max_word_len)
     for ichar, c in enumerate(word):
-        data[iword, ichar, :] = c2i[c]
+        data[iword, ichar, c2i[c]] = True
 
 print('Storing dataset...')
 with open('./data/words_4gan.npz', 'wb') as f:
