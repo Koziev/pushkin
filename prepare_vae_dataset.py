@@ -18,14 +18,15 @@ from future.utils import iteritems
 
 data_folder = '../data'
 
+# Текстовый файл с векторыми слов в word2vec формате, который может прочитать
+# gensim.
 #w2v_path = r'f:\Word2Vec\word_vectors_cbow=1_win=5_dim=32.txt'
 w2v_path = '/home/eek/polygon/w2v/w2v.CBOW=0_WIN=5_DIM=48.txt'
 
+# Путь к файлу со списком фраз, на которых будет тренироваться модель.
 corpus_path = '../data/phrases.txt'
 
 MAX_SENT_LEN = 6
-
-
 
 
 def decode_output(y, v2w):
@@ -57,7 +58,6 @@ def decode_output(y, v2w):
         decoded_phrases.append(u' '.join(phrase_words))
 
     return decoded_phrases
-
 
 if __name__ == '__main__':
 

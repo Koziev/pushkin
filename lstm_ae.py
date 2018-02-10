@@ -23,6 +23,7 @@ from keras.layers.core import Lambda
 
 import tqdm
 import sklearn.model_selection
+import scipy.spatial.distance
 import pickle
 import numpy as np
 import sys
@@ -32,30 +33,37 @@ import os
 from future.utils import iteritems
 
 
-tmp_folder = '../tmp'
-model_folder = '../tmp'
-
 BATCH_SIZE = 32
 
 # длина вектора на выходе кодирующей части автоэнкодера, фактически это
 # длина вектора, представляющего предложение.
 latent_dim = 64
 
-NB_EPOCHS = 100  # макс. кол-во эпох обучения
+NB_EPOCHS = 200  # макс. кол-во эпох обучения
 
 # Конфигурация нейросетки:
 # arch - общая архитектура: 'ae' для простого сжимающего автоэнкодера, 'vae' для
 #        вариационного автоэнкодера
 # encoder - структура кодирующей части
 # decoder - структура декодера
-# NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
-NET_CONFIG={'arch': 'vae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,lstm'}
+NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
+# NET_CONFIG={'arch': 'vae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
 
+
+# Путь к папке с файлами датасетов, подготовленных
+# скриптом prepare_vase_dataset.py
+data_folder = '../data'
+
+# В этом каталоге будем сохранять файлы с конфигурацией и весами натренированной модели.
+model_folder = '../tmp'
+
+tmp_folder = '../tmp'
 
 
 def create_ae(net_config, max_seq_len, word_dims, latent_dim):
     """
-    Создается классический автоэнкодер с архитектурой seq2seq.
+    Создается классический сжимающий автоэнкодер с архитектурой seq2seq для упаковки
+    предложения в вектор фиксированного размера latent_dim.
     Возвращается 3 модели - полный автоэнкодер, кодер и декодер.
     """
     encoder_input = Input(shape=(max_seq_len, word_dims,), dtype='float32', name='input_words')
@@ -86,10 +94,10 @@ def create_ae(net_config, max_seq_len, word_dims, latent_dim):
             encoder_size += rnn_size
 
         encoder_merged = keras.layers.concatenate(inputs=convs)
-        encoder_final = Dense(units=int(latent_dim), activation='sigmoid')(encoder_merged)
+        encoder_final = Dense(units=int(latent_dim), activation='tanh')(encoder_merged)
     elif net_config['encoder'] == 'lstm':
         encoder_final = recurrent.LSTM(latent_dim, return_sequences=False)(encoder_input)
-        encoder_final = Dense(units=int(latent_dim), activation='sigmoid')(encoder_final)
+        encoder_final = Dense(units=int(latent_dim), activation='tanh')(encoder_final)
 
     # декодер
     decoder = RepeatVector(max_seq_len)(encoder_final)
@@ -141,6 +149,8 @@ def create_vae(
                batch_size,
                epsilon_std=1.):
     """
+    Исходный код взят из https://github.com/twairball/keras_lstm_vae/blob/master/lstm_vae/vae.py
+
     Creates an LSTM Variational Autoencoder (VAE). Returns VAE, Encoder, Generator.
     # Arguments
         input_dim: int.
@@ -185,7 +195,7 @@ def create_vae(
             encoder_size += rnn_size
 
         encoder_merged = keras.layers.concatenate(inputs=convs)
-        encoder_final = Dense(units=int(latent_dim), activation='sigmoid')(encoder_merged)
+        encoder_final = Dense(units=int(latent_dim), activation='tanh')(encoder_merged)
     elif net_config['encoder'] == 'lstm':
         encoder_final = recurrent.LSTM(latent_dim, return_sequences=False)(encoder_input)
         #encoder_final = Dense(units=int(latent_dim), activation='sigmoid')(encoder_final)
@@ -280,6 +290,13 @@ def decode_output(y, v2w):
     return decoded_phrases
 
 
+def v_cosine(v1, v2):
+    s = scipy.spatial.distance.cosine(v1, v2)
+    if np.isinf(s) or np.isnan(s):
+        s = 0.0
+
+    return s
+
 class colors:
     ok = '\033[92m'
     fail = '\033[91m'
@@ -305,21 +322,34 @@ class VisualizeCallback(keras.callbacks.Callback):
         X_test = self.X_data[idx]
         y_test = self.model.predict(X_test, verbose=0)
 
+        # Расчет точности восстановления полного теста предложения работает достаточно
+        # медленно, так как надо делать полный перебор записей в словаре для каждого слова.
+        # Поэтому ограничиваем количество проверяемых сэмплов.
+        nb_max_tested = 5000
         nb_tested = 0
         nb_errors = 0
-        for iphrase in range(min(10,X_test.shape[0])):
+
+        for iphrase in range(min(nb_max_tested,X_test.shape[0])):
             input_phrase = decode_output(X_test[iphrase:iphrase+1], self.v2w)[0]
             output_phrase = decode_output(y_test[iphrase:iphrase+1], self.v2w)[0]
-            print(colors.ok + '☑ ' + colors.close if input_phrase == output_phrase else colors.fail + '☒ ' + colors.close,
-                  end='')
 
-            print(u'{} ==> {}'.format(input_phrase, output_phrase))
+            nb_tested += 1
+            if input_phrase != output_phrase:
+                nb_errors += 1
 
+            if iphrase<10:
+                print(colors.ok + '☑ ' + colors.close if input_phrase == output_phrase else colors.fail + '☒ ' + colors.close,
+                      end='')
+
+                print(u'{} ==> {}'.format(input_phrase, output_phrase))
+
+        acc = float(nb_tested-nb_errors)/nb_tested
+        print('Per sample accuracy={}'.format(acc))
 
 # -----------------------------------------------------------
 
 # Словарь с парами слово-вектор для печати читабельных результатов
-with open('../data/word2vec.pkl', 'r') as f:
+with open(os.path.join(data_folder, 'word2vec.pkl'), 'r') as f:
     word2vec = pickle.load(f)
 
 v2w = [(v, w) for w, v in iteritems(word2vec)]
@@ -343,7 +373,7 @@ while True:
 
 if do_train:
     # Загружаем подготовленный датасет с векторизованными фразами.
-    vtexts = np.load('../data/vtexts.npz')
+    vtexts = np.load(os.path.join(data_folder,'vtexts.npz'))
     vtexts = vtexts['arr_0']
 
     w2v_dims = vtexts.shape[2]
@@ -383,7 +413,7 @@ if do_train:
         'word_dims': w2v_dims
     }
 
-    with open(os.path.join(tmp_folder, 'lstm_ae.config'), 'w') as f:
+    with open(os.path.join(model_folder, 'lstm_ae.config'), 'w') as f:
         json.dump(model_config, f)
 
     monitor_metric = 'val_loss'
@@ -463,19 +493,51 @@ if do_train:
 
     decoder_model.save_weights(weights_path)
 
-    # Проверим, что модели кодера и декодера дают при последовательном применении
-    # тот же результат, что и полная модель автоэнкодера.
-    test_data = vtexts[0:BATCH_SIZE]
-    y_ae = ae_model.predict_on_batch(test_data)
-    y1 = encoder_model.predict_on_batch(test_data)
-    y_decoder = decoder_model.predict_on_batch(y1)
+    if False:
+        # Проверим, что модели кодера и декодера дают при последовательном применении
+        # тот же результат, что и полная модель автоэнкодера.
+        test_data = vtexts[0:BATCH_SIZE]
+        y_ae = ae_model.predict_on_batch(test_data)
+        y1 = encoder_model.predict_on_batch(test_data)
+        y_decoder = decoder_model.predict_on_batch(y1)
 
-    decoded_ae = decode_output(y_ae, v2w)
-    decoded_12 = decode_output(y_decoder, v2w)
+        decoded_ae = decode_output(y_ae, v2w)
+        decoded_12 = decode_output(y_decoder, v2w)
 
-    for phrase1, phrase2 in zip(decoded_ae, decoded_12):
-        print(u'ae={} decoder={}'.format(phrase1, phrase2))
+        for phrase1, phrase2 in zip(decoded_ae, decoded_12):
+            print(u'ae={} decoder={}'.format(phrase1, phrase2))
 
+    # оценка точности модели с лучшими весами
+    nb_val_batches = val_data.shape[0]//BATCH_SIZE
+    print('\nFinal validation on {} batches, {} samples'.format(nb_val_batches, val_data.shape[0]))
+    l2_loss = 0.0
+    cos_loss = 0.0
+    nb_tested = 0
+    nb_errors = 0
+    for ibatch in tqdm.tqdm(range(nb_val_batches), total=nb_val_batches):
+        batch_data = val_data[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
+        #batch_loss = ae_model.evaluate(x=batch_data, y=batch_data)
+        y_batch = ae_model.predict_on_batch(batch_data)
+        l2 = np.linalg.norm(batch_data-y_batch, axis=-1)
+        batch_loss = np.sum(l2)
+        l2_loss += batch_loss
+
+        for iphrase in range(batch_data.shape[0]):
+            for iword in range(batch_data.shape[1]):
+                c = v_cosine(batch_data[iphrase, iword, :], y_batch[iphrase, iword, :])
+                cos_loss += abs(1.0-c)
+
+            input_phrase = decode_output(batch_data[iphrase:iphrase + 1], v2w)[0]
+            output_phrase = decode_output(y_batch[iphrase:iphrase + 1], v2w)[0]
+            nb_tested += 1
+            if input_phrase != output_phrase:
+                nb_errors += 1
+
+    print('final L2 loss={}'.format(l2_loss))
+    print('final cos loss={}'.format(cos_loss))
+
+    acc = float(nb_tested-nb_errors)/nb_tested
+    print('final accuracy per sample={}'.format(acc))
 
 
 if do_vizualize:
@@ -501,7 +563,15 @@ if do_vizualize:
     # Это может быть не так, если там поставить relu вместо sigmoid активации.
     # В таком случае надо при тренировке модели оценить диапазон значений скрытых переменных
     # и записать в конфигурацию модели вектор максимальных и минимальных значений.
-    X_probe = np.random.uniform(0.0, 1.0, (nb_generated, latent_dim))
+    if NET_CONFIG['arch'] == 'ae':
+        # Для обычного автоэнкодера мы требовали никакого специального распределения
+        # для скрытых переменных, поэтому предполагаем там равномерное распределение.
+        X_probe = np.random.uniform(0.0, 1.0, (nb_generated, latent_dim))
+    elif NET_CONFIG['arch'] == 'vae':
+        # Для вариациноого автоэнкодера мы заставляли скрытые переменные распределяться
+        # по нормальному закону.
+        X_probe = np.random.normal(0.0, 1.0, (nb_generated, latent_dim))
+
     y_probe = model.predict(X_probe)
 
     # декодируем результаты работы модели
