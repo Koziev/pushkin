@@ -18,6 +18,14 @@
 готовый файл невозможно из-за его размера). В результате работы программы будут созданы файлы
 с векторизованными предложениями, которые и загрузит код в lstm_ae.py.
 
+## Generative Adversarial Network для генерации предложений
+
+Исключительно экспериментальный код.
+
+Простейший вариант GAN реализован в [gan_words.py](https://github.com/Koziev/pushkin/blob/master/PyCode/gan_words.py).
+
+В качестве входных данных берет, как и вышеописанные автоэнкодерные модели, файлы датасета,
+приготовленные [prepare_vae_dataset.py](https://github.com/Koziev/pushkin/blob/master/PyCode/prepare_vae_dataset.py). 
 
 ## Character sequence text entailment: продолжение символьной цепочки
 

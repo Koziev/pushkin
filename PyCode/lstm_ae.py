@@ -24,6 +24,7 @@ from keras.layers.core import Lambda
 import tqdm
 import sklearn.model_selection
 import scipy.spatial.distance
+from scipy import stats
 import pickle
 import numpy as np
 import sys
@@ -47,7 +48,7 @@ NB_EPOCHS = 200  # макс. кол-во эпох обучения
 # encoder - структура кодирующей части
 # decoder - структура декодера
 #NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
-NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
+NET_CONFIG={'arch': 'vae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
 
 
 # Путь к папке с файлами датасетов, подготовленных
@@ -401,23 +402,14 @@ if do_train:
     print('\ndecoder_model:')
     decoder_model.summary()
 
-    weights_path = os.path.join(model_folder, 'lstm_ae_coder.weights')
-    arch_filepath = os.path.join(model_folder, 'lstm_ae_coder.arch')
+    decoder_weights_path = os.path.join(model_folder, 'lstm_ae_decoder.weights')
+    decoder_arch_filepath = os.path.join(model_folder, 'lstm_ae_decoder.arch')
 
-    # сохраним конфиг модели в json файлике.
-    model_config = {
-        'max_seq_len': max_seq_len,
-        'latent_dim': latent_dim,
-        'arch_filepath': arch_filepath,
-        'weights_path': weights_path,
-        'word_dims': w2v_dims
-    }
-
-    with open(os.path.join(model_folder, 'lstm_ae.config'), 'w') as f:
-        json.dump(model_config, f)
+    encoder_weights_path = os.path.join(model_folder, 'lstm_ae_encoder.weights')
+    encoder_arch_filepath = os.path.join(model_folder, 'lstm_ae_edcoder.arch')
 
     monitor_metric = 'val_loss'
-    model_checkpoint = ModelCheckpoint(weights_path, monitor=monitor_metric,
+    model_checkpoint = ModelCheckpoint(decoder_weights_path, monitor=monitor_metric,
                                        verbose=1, save_best_only=True, mode='auto')
     early_stopping = EarlyStopping(monitor=monitor_metric, patience=10, verbose=1, mode='auto')
 
@@ -483,15 +475,65 @@ if do_train:
                     break
 
 
-    # Загружаем последние лучшие веса модели
-    ae_model.load_weights(weights_path)
+    # Загружаем последние лучшие веса полной модели
+    ae_model.load_weights(decoder_weights_path)
 
     # Теперь можем сохранить декодер, что позволит
     # потом использовать ее для генерации текста.
-    with open(arch_filepath, 'w') as f:
+    with open(decoder_arch_filepath, 'w') as f:
         f.write(decoder_model.to_json())
 
-    decoder_model.save_weights(weights_path)
+    decoder_model.save_weights(decoder_weights_path)
+
+
+    # Сохраняем также энкодер, так как он может понадобиться для экспериментов
+    with open(encoder_arch_filepath, 'w') as f:
+        f.write(encoder_model.to_json())
+
+    encoder_model.save_weights(encoder_weights_path)
+
+    # Оценим распределение значений переменных в скрытом слое (на выходе энкодера)
+    nb_batches = min(100, train_data.shape[0]//BATCH_SIZE)
+    nb_rec = nb_batches * BATCH_SIZE
+    latents = np.zeros((nb_rec, latent_dim))
+    print('\nGenerating latent vectors on {} batches'.format(nb_batches))
+    for ibatch in tqdm.tqdm(range(nb_batches), total=nb_batches):
+        batch_data = train_data[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
+        y_batch = encoder_model.predict_on_batch(batch_data)
+        latents[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE, :] = y_batch
+
+    latent_mins = np.zeros((latent_dim))
+    latent_maxs = np.zeros((latent_dim))
+    for idim in range(latent_dim):
+        latent_mins[idim] = np.amin(latents[:, idim])
+        latent_maxs[idim] = np.amax(latents[:, idim])
+
+    # распределение значений по каждой переменной будем аппроксимировать
+    # гистограммой.
+    latent_histos = []
+    for idim in range(latent_dim):
+        h = np.histogram(a=latents[:, idim], range=(latent_mins[idim], latent_maxs[idim]), bins=20)
+        latent_histos.append(h)
+
+    latent_histos_path = os.path.join(tmp_folder, 'latent_histos.pkl' )
+    with open(latent_histos_path, 'wb') as f:
+        pickle.dump(latent_histos, f)
+
+    # сохраним конфиг модели в json файлике.
+    model_config = {
+        'max_seq_len': max_seq_len,
+        'latent_dim': latent_dim,
+        'decoder_arch_filepath': decoder_arch_filepath,
+        'decoder_weights_path': decoder_weights_path,
+        'encoder_arch_filepath': encoder_arch_filepath,
+        'encoder_weights_path': encoder_weights_path,
+        'word_dims': w2v_dims,
+        'latent_histos_path': latent_histos_path
+    }
+
+    with open(os.path.join(model_folder, 'lstm_ae.config'), 'w') as f:
+        json.dump(model_config, f)
+
 
     if False:
         # Проверим, что модели кодера и декодера дают при последовательном применении
@@ -543,38 +585,46 @@ if do_train:
 
 
 if do_vizualize:
+
     # Загружаем конфигурацию модели с данными, необходимыми для
     # восстановления архитектуры сетки и формирования входных данных.
     with open(os.path.join(model_folder, 'lstm_ae.config'), 'r') as f:
         model_config = json.load(f)
 
         max_seq_len = model_config['max_seq_len']
-        arch_filepath = model_config['arch_filepath']
-        weights_path = model_config['weights_path']
+        decoder_arch_filepath = model_config['decoder_arch_filepath']
+        decoder_weights_path = model_config['decoder_weights_path']
+        encoder_arch_filepath = model_config['encoder_arch_filepath']
+        encoder_weights_path = model_config['encoder_weights_path']
         word_dims = model_config['word_dims']
         latent_dim = model_config['latent_dim']
+        latent_histos_path = model_config['latent_histos_path']
 
-    with open(arch_filepath, 'r') as f:
-        model = model_from_json(f.read())
+    with open(decoder_arch_filepath, 'r') as f:
+        decoder_model = model_from_json(f.read())
 
-    model.load_weights(weights_path)
+    decoder_model.load_weights(decoder_weights_path)
 
     nb_generated = 10  # столько случайных фраз сгенерируем и покажем
 
-    # Предполагаем, что скрытые переменные на выходе энкодера имеют диапазон 0..1
-    # Это может быть не так, если там поставить relu вместо sigmoid активации.
-    # В таком случае надо при тренировке модели оценить диапазон значений скрытых переменных
-    # и записать в конфигурацию модели вектор максимальных и минимальных значений.
-    if NET_CONFIG['arch'] == 'ae':
-        # Для обычного автоэнкодера мы требовали никакого специального распределения
-        # для скрытых переменных, поэтому предполагаем там равномерное распределение.
-        X_probe = np.random.uniform(0.0, 1.0, (nb_generated, latent_dim))
-    elif NET_CONFIG['arch'] == 'vae':
-        # Для вариациноого автоэнкодера мы заставляли скрытые переменные распределяться
-        # по нормальному закону.
-        X_probe = np.random.normal(0.0, 1.0, (nb_generated, latent_dim))
 
-    y_probe = model.predict(X_probe)
+    # Мы должны подавать на входе декодера вектор скрытых переменных с разбросом
+    # значений отдельных компонентов, примерно соответствующим распределению
+    # для тренировочных данных. Мы уже собрали гистограммы для каждой скрытой переменной,
+    # их надо загрузить и использовать.
+    with open(latent_histos_path, 'rb') as f:
+        latent_histos = pickle.load(f)
+
+    pdfs = []
+    for idim, histo in enumerate(latent_histos):
+        pdfs.append(stats.rv_histogram(histogram=histo))
+
+    X_probe = np.zeros((nb_generated, latent_dim))
+    for idim in range(latent_dim):
+        p = pdfs[idim].rvs(size=nb_generated)
+        X_probe[:, idim] = p
+
+    y_probe = decoder_model.predict(X_probe)
 
     # декодируем результаты работы модели
     result_phrases = decode_output(y_probe, v2w)
