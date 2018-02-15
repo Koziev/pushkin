@@ -4,6 +4,17 @@
 на базе LSTM+Conv (точная конфигурация нейросети настраивается).
 Тренируется на подготовленном заранее датасете - см. скрипты prepare_phrases.py
 и prepare_vae_dataset.py
+
+Тренировка модели состоит из 2х этапов, которые выполняются отдельным запуском
+данного скрипта. Сначала происходит собственно тренировка автоэнкодера, веса
+и архитектура нейросеток сохраняются на диск. Во второй части подгружается кодирующая
+нейросетка, через нее прогоняются все исходные данные, и происходит
+оценка распределения значений компонентов скрытого вектора на выходе кодера. Полученные
+гистограммы также сохраняются на диск.
+
+После того, как модель прошла первые два этапа, ее можно использовать для генерации
+новых предложений.
+
 """
 
 from __future__ import print_function, division
@@ -30,6 +41,8 @@ import numpy as np
 import sys
 import json
 import os
+import argparse
+
 
 from future.utils import iteritems
 
@@ -47,8 +60,8 @@ NB_EPOCHS = 200  # макс. кол-во эпох обучения
 #        вариационного автоэнкодера
 # encoder - структура кодирующей части
 # decoder - структура декодера
-#NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
-NET_CONFIG={'arch': 'vae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
+NET_CONFIG={'arch': 'ae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
+#NET_CONFIG={'arch': 'vae', 'encoder': 'lstm(cnn)', 'decoder': 'lstm,dense'}
 
 
 # Путь к папке с файлами датасетов, подготовленных
@@ -260,36 +273,6 @@ def create_vae(
     return vae, encoder, generator
 
 
-def decode_output(y, v2w):
-    """
-    Декодируем выходной тензор автоэнкодера, получаем читабельные
-    предложения в том же порядке, как входные.
-    """
-    decoded_phrases = []
-
-    for iphrase in range(y.shape[0]):
-        phrase_vectors = y[iphrase]
-        phrase_words = []
-        for iword in range(y.shape[1]):
-            word_vector = phrase_vectors[iword]
-            l2 = np.linalg.norm(word_vector)
-            if l2<0.1:
-                break
-
-            min_dist = 1e38
-            best_word = u''
-            for v, w in v2w:
-                d = np.linalg.norm(v - word_vector)
-                if d < min_dist:
-                    min_dist = d
-                    best_word = w
-
-            phrase_words.append(best_word)
-
-        decoded_phrases.append(u' '.join(phrase_words))
-
-    return decoded_phrases
-
 
 def v_cosine(v1, v2):
     s = scipy.spatial.distance.cosine(v1, v2)
@@ -297,6 +280,66 @@ def v_cosine(v1, v2):
         s = 0.0
 
     return s
+
+
+def find_word_l2(word_vector, v2w):
+    """
+    Поиск слова, максимально близкого к заданному вектору word_vector,
+    с использованием евклидового расстояния.
+    """
+    min_dist = 1e38
+    best_word = u''
+    for v, w in v2w:
+        d = np.linalg.norm(v - word_vector)
+        if d < min_dist:
+            min_dist = d
+            best_word = w
+
+    return best_word
+
+
+def find_word_cos(word_vector, v2w):
+    """
+    Поиск слова, максимально близкого к заданному вектору word_vector,
+    с использованием косинусной близости.
+    """
+    max_sim = -1.0
+    best_word = u''
+    for v, w in v2w:
+        d = v_cosine(v, word_vector)
+        if d >= max_sim:
+            max_sim = d
+            best_word = w
+
+    return best_word
+
+
+def decode_output(y, v2w):
+    """
+    Декодируем выходной тензор автоэнкодера, получаем читабельные
+    предложения в том же порядке, как входные.
+    """
+    decoded_phrases = []
+    null_word = u'(null)'
+    for iphrase in range(y.shape[0]):
+        phrase_vectors = y[iphrase]
+        phrase_words = []
+        for iword in range(y.shape[1]):
+            word_vector = phrase_vectors[iword]
+            l2 = np.linalg.norm(word_vector)
+            best_word = null_word
+            if l2>0.1:
+                best_word = find_word_l2(word_vector, v2w)
+
+            phrase_words.append(best_word)
+
+        while len(phrase_words) > 0 and phrase_words[-1] == null_word:
+            phrase_words = phrase_words[:-1]
+
+        decoded_phrases.append(u' '.join(phrase_words))
+
+    return decoded_phrases
+
 
 class colors:
     ok = '\033[92m'
@@ -347,6 +390,20 @@ class VisualizeCallback(keras.callbacks.Callback):
         acc = float(nb_tested-nb_errors)/nb_tested
         print('Per sample accuracy={}'.format(acc))
 
+
+# -----------------------------------------------------------
+
+parser = argparse.ArgumentParser(description='Training autoencoders and generating random phrases')
+parser.add_argument('--train', default=0, type=int, help='train autoencoder model')
+parser.add_argument('--estimate', default=0, type=int, help='estimate latent PDFs with trained model')
+parser.add_argument('--generate', default=0, type=int, help='use trained model and PDFs estimations for random text generation')
+
+args = parser.parse_args()
+
+do_train = args.train
+do_estimate_pdfs = args.estimate
+do_vizualize = args.generate
+
 # -----------------------------------------------------------
 
 # Словарь с парами слово-вектор для печати читабельных результатов
@@ -357,19 +414,20 @@ v2w = [(v, w) for w, v in iteritems(word2vec)]
 
 # -----------------------------------------------------------
 
-do_train = False
-do_vizualize = False
-while True:
-    print('t - train the model\ng - generate random texts with trained model')
+while not do_train and not do_estimate_pdfs and not do_vizualize:
+    print('1 - train the model\n2 - estimate latent PDFs\n3 - generate random texts with trained model')
     run_mode = raw_input('? ').decode(sys.stdout.encoding).strip().lower()
-    if run_mode == 't':
+    if run_mode == '1':
         do_train = True
         break
-    elif run_mode == 'g':
+    elif run_mode == '2':
         do_vizualize = True
         break
+    elif run_mode == '3':
+        do_estimate_pdfs = True
+        break
     else:
-        print('Invalid selection, please repeat')
+        print('Invalid selection, please re-enter your choice')
 
 
 if do_train:
@@ -492,33 +550,6 @@ if do_train:
 
     encoder_model.save_weights(encoder_weights_path)
 
-    # Оценим распределение значений переменных в скрытом слое (на выходе энкодера)
-    nb_batches = min(100, train_data.shape[0]//BATCH_SIZE)
-    nb_rec = nb_batches * BATCH_SIZE
-    latents = np.zeros((nb_rec, latent_dim))
-    print('\nGenerating latent vectors on {} batches'.format(nb_batches))
-    for ibatch in tqdm.tqdm(range(nb_batches), total=nb_batches):
-        batch_data = train_data[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
-        y_batch = encoder_model.predict_on_batch(batch_data)
-        latents[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE, :] = y_batch
-
-    latent_mins = np.zeros((latent_dim))
-    latent_maxs = np.zeros((latent_dim))
-    for idim in range(latent_dim):
-        latent_mins[idim] = np.amin(latents[:, idim])
-        latent_maxs[idim] = np.amax(latents[:, idim])
-
-    # распределение значений по каждой переменной будем аппроксимировать
-    # гистограммой.
-    latent_histos = []
-    for idim in range(latent_dim):
-        h = np.histogram(a=latents[:, idim], range=(latent_mins[idim], latent_maxs[idim]), bins=20)
-        latent_histos.append(h)
-
-    latent_histos_path = os.path.join(tmp_folder, 'latent_histos.pkl' )
-    with open(latent_histos_path, 'wb') as f:
-        pickle.dump(latent_histos, f)
-
     # сохраним конфиг модели в json файлике.
     model_config = {
         'max_seq_len': max_seq_len,
@@ -528,7 +559,7 @@ if do_train:
         'encoder_arch_filepath': encoder_arch_filepath,
         'encoder_weights_path': encoder_weights_path,
         'word_dims': w2v_dims,
-        'latent_histos_path': latent_histos_path
+        'NET_CONFIG': NET_CONFIG
     }
 
     with open(os.path.join(model_folder, 'lstm_ae.config'), 'w') as f:
@@ -584,6 +615,65 @@ if do_train:
     print('final accuracy per sample={}'.format(acc))
 
 
+if do_estimate_pdfs:
+    print('Estimating PDFs of latent variables...')
+    # Будем оценивать распределение значений на скрытом слое (выход кодирующей
+    # части автоэнкодера), пропуская через него все исходные данные.
+    vtexts = np.load(os.path.join(data_folder,'vtexts.npz'))
+    vtexts = vtexts['arr_0']
+
+    # Загружаем конфигурацию модели
+    with open(os.path.join(model_folder, 'lstm_ae.config'), 'r') as f:
+        model_config = json.load(f)
+
+        max_seq_len = model_config['max_seq_len']
+        decoder_arch_filepath = model_config['decoder_arch_filepath']
+        decoder_weights_path = model_config['decoder_weights_path']
+        encoder_arch_filepath = model_config['encoder_arch_filepath']
+        encoder_weights_path = model_config['encoder_weights_path']
+        word_dims = model_config['word_dims']
+        latent_dim = model_config['latent_dim']
+        NET_CONFIG = model_config['NET_CONFIG']
+
+    # восстанавливаем кодер
+    with open(encoder_arch_filepath, 'r') as f:
+        encoder_model = model_from_json(f.read())
+
+    encoder_model.load_weights(encoder_weights_path)
+
+    # Оценим распределение значений переменных в скрытом слое (на выходе энкодера)
+    nb_batches = min(100, vtexts.shape[0]//BATCH_SIZE)
+    nb_rec = nb_batches * BATCH_SIZE
+    latents = np.zeros((nb_rec, latent_dim))
+    print('\nGenerating latent vectors on {} batches'.format(nb_batches))
+    for ibatch in tqdm.tqdm(range(nb_batches), total=nb_batches):
+        batch_data = vtexts[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
+        y_batch = encoder_model.predict_on_batch(batch_data)
+        latents[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE, :] = y_batch
+
+    latent_mins = np.zeros((latent_dim))
+    latent_maxs = np.zeros((latent_dim))
+    for idim in range(latent_dim):
+        latent_mins[idim] = np.amin(latents[:, idim])
+        latent_maxs[idim] = np.amax(latents[:, idim])
+
+    # распределение значений по каждой переменной будем аппроксимировать
+    # гистограммой.
+    latent_histos = []
+    for idim in range(latent_dim):
+        h = np.histogram(a=latents[:, idim], range=(latent_mins[idim], latent_maxs[idim]), bins=20)
+        latent_histos.append(h)
+
+    latent_histos_path = os.path.join(tmp_folder, 'latent_histos.pkl' )
+    with open(latent_histos_path, 'wb') as f:
+        pickle.dump(latent_histos, f)
+
+    # дополняем конфиг модели данными о гистограммах
+    model_config['latent_histos_path'] = latent_histos_path
+    with open(os.path.join(model_folder, 'lstm_ae.config'), 'w') as f:
+        json.dump(model_config, f)
+
+
 if do_vizualize:
 
     # Загружаем конфигурацию модели с данными, необходимыми для
@@ -599,6 +689,7 @@ if do_vizualize:
         word_dims = model_config['word_dims']
         latent_dim = model_config['latent_dim']
         latent_histos_path = model_config['latent_histos_path']
+        NET_CONFIG = model_config['NET_CONFIG']
 
     with open(decoder_arch_filepath, 'r') as f:
         decoder_model = model_from_json(f.read())
@@ -607,23 +698,28 @@ if do_vizualize:
 
     nb_generated = 10  # столько случайных фраз сгенерируем и покажем
 
+    if False:  #NET_CONFIG['arch'] == 'vae':
+        # Для вариационного автоэнкодера нужно на вход декодера подавать
+        # нормально распределенный шум с единичной дисперсией.
+        X_probe = np.random.normal(loc=1.0, scale=1.0, size=(nb_generated, latent_dim))
+    else:
+        # Мы должны подавать на входе декодера вектор скрытых переменных с разбросом
+        # значений отдельных компонентов, примерно соответствующим распределению
+        # для тренировочных данных. Мы уже собрали гистограммы для каждой скрытой переменной,
+        # их надо загрузить и использовать.
+        with open(latent_histos_path, 'rb') as f:
+            latent_histos = pickle.load(f)
 
-    # Мы должны подавать на входе декодера вектор скрытых переменных с разбросом
-    # значений отдельных компонентов, примерно соответствующим распределению
-    # для тренировочных данных. Мы уже собрали гистограммы для каждой скрытой переменной,
-    # их надо загрузить и использовать.
-    with open(latent_histos_path, 'rb') as f:
-        latent_histos = pickle.load(f)
+        pdfs = []
+        for idim, histo in enumerate(latent_histos):
+            pdfs.append(stats.rv_histogram(histogram=histo))
 
-    pdfs = []
-    for idim, histo in enumerate(latent_histos):
-        pdfs.append(stats.rv_histogram(histogram=histo))
+        X_probe = np.zeros((nb_generated, latent_dim))
+        for idim in range(latent_dim):
+            p = pdfs[idim].rvs(size=nb_generated)
+            X_probe[:, idim] = p
 
-    X_probe = np.zeros((nb_generated, latent_dim))
-    for idim in range(latent_dim):
-        p = pdfs[idim].rvs(size=nb_generated)
-        X_probe[:, idim] = p
-
+    # Пропускаем подготовленный вектор через декодер.
     y_probe = decoder_model.predict(X_probe)
 
     # декодируем результаты работы модели
