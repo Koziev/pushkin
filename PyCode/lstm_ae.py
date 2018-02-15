@@ -6,15 +6,14 @@
 и prepare_vae_dataset.py
 
 Тренировка модели состоит из 2х этапов, которые выполняются отдельным запуском
-данного скрипта. Сначала происходит собственно тренировка автоэнкодера, веса
-и архитектура нейросеток сохраняются на диск. Во второй части подгружается кодирующая
+данного скрипта. Сначала происходит собственно тренировка автоэнкодера (--train), веса
+и архитектура нейросеток сохраняются на диск. Во второй части (--estimate) подгружается кодирующая
 нейросетка, через нее прогоняются все исходные данные, и происходит
 оценка распределения значений компонентов скрытого вектора на выходе кодера. Полученные
 гистограммы также сохраняются на диск.
 
 После того, как модель прошла первые два этапа, ее можно использовать для генерации
-новых предложений.
-
+новых предложений (--generate 1).
 """
 
 from __future__ import print_function, division
@@ -43,7 +42,6 @@ import json
 import os
 import argparse
 
-
 from future.utils import iteritems
 
 
@@ -70,8 +68,6 @@ data_folder = '../data'
 
 # В этом каталоге будем сохранять файлы с конфигурацией и весами натренированной модели.
 model_folder = '../tmp'
-
-tmp_folder = '../tmp'
 
 
 def create_ae(net_config, max_seq_len, word_dims, latent_dim):
@@ -390,7 +386,6 @@ class VisualizeCallback(keras.callbacks.Callback):
         acc = float(nb_tested-nb_errors)/nb_tested
         print('Per sample accuracy={}'.format(acc))
 
-
 # -----------------------------------------------------------
 
 parser = argparse.ArgumentParser(description='Training autoencoders and generating random phrases')
@@ -664,7 +659,7 @@ if do_estimate_pdfs:
         h = np.histogram(a=latents[:, idim], range=(latent_mins[idim], latent_maxs[idim]), bins=20)
         latent_histos.append(h)
 
-    latent_histos_path = os.path.join(tmp_folder, 'latent_histos.pkl' )
+    latent_histos_path = os.path.join(model_folder, 'latent_histos.pkl' )
     with open(latent_histos_path, 'wb') as f:
         pickle.dump(latent_histos, f)
 
