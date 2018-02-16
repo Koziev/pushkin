@@ -30,6 +30,7 @@ from keras.layers.wrappers import TimeDistributed
 from keras import backend as K
 from keras import objectives
 from keras.layers.core import Lambda
+from keras import regularizers
 
 import tqdm
 import sklearn.model_selection
@@ -45,13 +46,13 @@ import argparse
 from future.utils import iteritems
 
 
-BATCH_SIZE = 32
-
 # длина вектора на выходе кодирующей части автоэнкодера, фактически это
 # длина вектора, представляющего предложение.
 latent_dim = 64
 
 NB_EPOCHS = 200  # макс. кол-во эпох обучения
+
+batch_size = 32
 
 # Конфигурация нейросетки:
 # arch - общая архитектура: 'ae' для простого сжимающего автоэнкодера, 'vae' для
@@ -103,11 +104,14 @@ def create_ae(net_config, max_seq_len, word_dims, latent_dim):
 
             encoder_size += rnn_size
 
-        encoder_merged = keras.layers.concatenate(inputs=convs)
-        encoder_final = Dense(units=int(latent_dim), activation='tanh')(encoder_merged)
+        encoder_final = keras.layers.concatenate(inputs=convs)
     elif net_config['encoder'] == 'lstm':
         encoder_final = recurrent.LSTM(latent_dim, return_sequences=False)(encoder_input)
-        encoder_final = Dense(units=int(latent_dim), activation='tanh')(encoder_final)
+
+    encoder_final = Dense(units=int(latent_dim),
+                          activation='tanh',
+                          activity_regularizer = regularizers.l1(1e-5)
+                          )(encoder_final)
 
     # декодер
     decoder = RepeatVector(max_seq_len)(encoder_final)
@@ -392,12 +396,16 @@ parser = argparse.ArgumentParser(description='Training autoencoders and generati
 parser.add_argument('--train', default=0, type=int, help='train autoencoder model')
 parser.add_argument('--estimate', default=0, type=int, help='estimate latent PDFs with trained model')
 parser.add_argument('--generate', default=0, type=int, help='use trained model and PDFs estimations for random text generation')
+parser.add_argument('--epochs', default=NB_EPOCHS, type=int, help='max number of epochs when training the model')
+parser.add_argument('--batch_size', default=32, type=int, help='size of minibatch when training the model')
 
 args = parser.parse_args()
 
 do_train = args.train
 do_estimate_pdfs = args.estimate
 do_vizualize = args.generate
+nb_epochs = args.epochs
+batch_size = args.batch_size
 
 # -----------------------------------------------------------
 
@@ -442,7 +450,7 @@ if do_train:
     if NET_CONFIG['arch'] == 'ae':
         ae_model, encoder_model, decoder_model = create_ae(NET_CONFIG, max_seq_len, w2v_dims, latent_dim)
     elif NET_CONFIG['arch'] == 'vae':
-        ae_model, encoder_model, decoder_model = create_vae(NET_CONFIG, max_seq_len, w2v_dims, latent_dim, BATCH_SIZE )
+        ae_model, encoder_model, decoder_model = create_vae(NET_CONFIG, max_seq_len, w2v_dims, latent_dim, batch_size)
     else:
         raise NotImplemented()
 
@@ -466,67 +474,26 @@ if do_train:
                                        verbose=1, save_best_only=True, mode='auto')
     early_stopping = EarlyStopping(monitor=monitor_metric, patience=10, verbose=1, mode='auto')
 
-    viz = VisualizeCallback(ae_model, vtexts, v2w, BATCH_SIZE)
+    viz = VisualizeCallback(ae_model, vtexts, v2w, batch_size)
 
     callbacks = [viz, model_checkpoint, early_stopping]
 
-    val_size = (int(0.2*vtexts.shape[0])//BATCH_SIZE)*BATCH_SIZE
+    val_size = (int(0.2*vtexts.shape[0]) // batch_size) * batch_size
     train_data, val_data = sklearn.model_selection.train_test_split( vtexts, test_size=val_size, random_state=123456)
 
     # для VAE нужно, чтобы данные были точно выровнены на BATCH_SIZE.
-    if (train_data.shape[0]%BATCH_SIZE) != 0:
-        train_data = train_data[ : (train_data.shape[0]//BATCH_SIZE)*BATCH_SIZE ]
+    if (train_data.shape[0]%batch_size) != 0:
+        train_data = train_data[: (train_data.shape[0] // batch_size) * batch_size]
 
-
-    if True:
+    if nb_epochs>0:
         hist = ae_model.fit(x=train_data,
                             y=train_data,
                             validation_data=(val_data, val_data),
-                            batch_size=BATCH_SIZE,
-                            epochs=NB_EPOCHS,
+                            batch_size=batch_size,
+                            epochs=nb_epochs,
                             verbose=1,
                             callbacks=callbacks,
-                           )
-    else:
-        nb_train_batches = train_data.shape[0]//BATCH_SIZE
-        nb_val_batches = val_data.shape[0]//BATCH_SIZE
-
-        nb_no_impovements = 0
-        best_loss = 1e38
-
-        for epoch in range(10):
-            print('Epoch {}'.format(epoch))
-
-            # случайная перестановка паттернов в обучающих записях
-            #print('Train on {} batches'.format(nb_train_batches))
-            train_idx = np.random.permutation(range(train_data.shape[0]))
-            for ibatch in tqdm.tqdm(range(nb_train_batches), total=nb_train_batches, desc='Train on {} batches'.format(nb_train_batches)):
-                batch_data = train_data[train_idx][ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
-                ae_model.train_on_batch(x=batch_data, y=batch_data)
-
-            # Оцениваем точность на валидационных данных
-            print('Validate on {} batches'.format(nb_val_batches))
-            val_loss = 0
-            for ibatch in range(nb_val_batches):
-                batch_data = val_data[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
-                #batch_loss = ae_model.evaluate(x=batch_data, y=batch_data)
-                y_batch = ae_model.predict_on_batch(batch_data)
-                l2 = np.linalg.norm(batch_data-y_batch, axis=-1)
-                batch_loss = np.sum(l2)
-                val_loss += batch_loss
-
-            print('val_loss={}'.format(val_loss))
-            if val_loss < best_loss:
-                print('val_loss improved from {} to {}, storing weights to {}'.format(best_loss, val_loss, weights_path))
-                ae_model.save_weights(weights_path)
-                best_loss = val_loss
-                nb_no_impovements = 0
-            else:
-                nb_no_impovements += 1
-                if nb_no_impovements>10:
-                    print('early stopping on {} epochs with no improvements'.format(nb_no_impovements))
-                    break
-
+                            )
 
     # Загружаем последние лучшие веса полной модели
     ae_model.load_weights(decoder_weights_path)
@@ -537,7 +504,6 @@ if do_train:
         f.write(decoder_model.to_json())
 
     decoder_model.save_weights(decoder_weights_path)
-
 
     # Сохраняем также энкодер, так как он может понадобиться для экспериментов
     with open(encoder_arch_filepath, 'w') as f:
@@ -564,7 +530,7 @@ if do_train:
     if False:
         # Проверим, что модели кодера и декодера дают при последовательном применении
         # тот же результат, что и полная модель автоэнкодера.
-        test_data = vtexts[0:BATCH_SIZE]
+        test_data = vtexts[0:batch_size]
         y_ae = ae_model.predict_on_batch(test_data)
         y1 = encoder_model.predict_on_batch(test_data)
         y_decoder = decoder_model.predict_on_batch(y1)
@@ -575,39 +541,40 @@ if do_train:
         for phrase1, phrase2 in zip(decoded_ae, decoded_12):
             print(u'ae={} decoder={}'.format(phrase1, phrase2))
 
-    # оценка точности модели с лучшими весами
-    # для больших датасетов валидация может растянутся на часы, так что
-    # ограничиваем кол-во проверяемых сэмплов.
-    nb_val_batches = min(100, val_data.shape[0]//BATCH_SIZE)
-    print('\nFinal validation on {} batches, {} samples'.format(nb_val_batches, val_data.shape[0]))
-    l2_loss = 0.0
-    cos_loss = 0.0
-    nb_tested = 0
-    nb_errors = 0
-    for ibatch in tqdm.tqdm(range(nb_val_batches), total=nb_val_batches):
-        batch_data = val_data[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
-        #batch_loss = ae_model.evaluate(x=batch_data, y=batch_data)
-        y_batch = ae_model.predict_on_batch(batch_data)
-        l2 = np.linalg.norm(batch_data-y_batch, axis=-1)
-        batch_loss = np.sum(l2)
-        l2_loss += batch_loss
+    if False:
+        # оценка точности модели с лучшими весами
+        # для больших датасетов валидация может растянутся на часы, так что
+        # ограничиваем кол-во проверяемых сэмплов.
+        nb_val_batches = min(100, val_data.shape[0] // batch_size)
+        print('\nFinal validation on {} batches, {} samples'.format(nb_val_batches, val_data.shape[0]))
+        l2_loss = 0.0
+        cos_loss = 0.0
+        nb_tested = 0
+        nb_errors = 0
+        for ibatch in tqdm.tqdm(range(nb_val_batches), total=nb_val_batches):
+            batch_data = val_data[ibatch * batch_size:(ibatch + 1) * batch_size]
+            #batch_loss = ae_model.evaluate(x=batch_data, y=batch_data)
+            y_batch = ae_model.predict_on_batch(batch_data)
+            l2 = np.linalg.norm(batch_data-y_batch, axis=-1)
+            batch_loss = np.sum(l2)
+            l2_loss += batch_loss
 
-        for iphrase in range(batch_data.shape[0]):
-            for iword in range(batch_data.shape[1]):
-                c = v_cosine(batch_data[iphrase, iword, :], y_batch[iphrase, iword, :])
-                cos_loss += abs(1.0-c)
+            for iphrase in range(batch_data.shape[0]):
+                for iword in range(batch_data.shape[1]):
+                    c = v_cosine(batch_data[iphrase, iword, :], y_batch[iphrase, iword, :])
+                    cos_loss += abs(1.0-c)
 
-            input_phrase = decode_output(batch_data[iphrase:iphrase + 1], v2w)[0]
-            output_phrase = decode_output(y_batch[iphrase:iphrase + 1], v2w)[0]
-            nb_tested += 1
-            if input_phrase != output_phrase:
-                nb_errors += 1
+                input_phrase = decode_output(batch_data[iphrase:iphrase + 1], v2w)[0]
+                output_phrase = decode_output(y_batch[iphrase:iphrase + 1], v2w)[0]
+                nb_tested += 1
+                if input_phrase != output_phrase:
+                    nb_errors += 1
 
-    print('final L2 loss={}'.format(l2_loss))
-    print('final cos loss={}'.format(cos_loss))
+        print('final L2 loss={}'.format(l2_loss))
+        print('final cos loss={}'.format(cos_loss))
 
-    acc = float(nb_tested-nb_errors)/nb_tested
-    print('final accuracy per sample={}'.format(acc))
+        acc = float(nb_tested-nb_errors)/nb_tested
+        print('final accuracy per sample={}'.format(acc))
 
 
 if do_estimate_pdfs:
@@ -617,7 +584,7 @@ if do_estimate_pdfs:
     vtexts = np.load(os.path.join(data_folder,'vtexts.npz'))
     vtexts = vtexts['arr_0']
 
-    # Загружаем конфигурацию модели
+    # Загружаем конфигурацию модели, натренированной на предыдущем этапе --train
     with open(os.path.join(model_folder, 'lstm_ae.config'), 'r') as f:
         model_config = json.load(f)
 
@@ -637,14 +604,20 @@ if do_estimate_pdfs:
     encoder_model.load_weights(encoder_weights_path)
 
     # Оценим распределение значений переменных в скрытом слое (на выходе энкодера)
-    nb_batches = min(100, vtexts.shape[0]//BATCH_SIZE)
-    nb_rec = nb_batches * BATCH_SIZE
+    # Для этого прогоняем через кодер исходные данные.
+    nb_batches = vtexts.shape[0] // batch_size
+    nb_rec = nb_batches * batch_size
     latents = np.zeros((nb_rec, latent_dim))
+
     print('\nGenerating latent vectors on {} batches'.format(nb_batches))
     for ibatch in tqdm.tqdm(range(nb_batches), total=nb_batches):
-        batch_data = vtexts[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE]
+        batch_data = vtexts[ibatch * batch_size:(ibatch + 1) * batch_size]
         y_batch = encoder_model.predict_on_batch(batch_data)
-        latents[ibatch*BATCH_SIZE:(ibatch+1)*BATCH_SIZE, :] = y_batch
+        latents[ibatch * batch_size:(ibatch + 1) * batch_size, :] = y_batch
+
+    print('Storing {} latent vectors'.format(nb_rec))
+    with open(os.path.join(model_folder, 'latents.npz'), 'wb') as f:
+        np.savez_compressed(f, latents)
 
     latent_mins = np.zeros((latent_dim))
     latent_maxs = np.zeros((latent_dim))
