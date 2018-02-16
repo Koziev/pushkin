@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Подготовка датасета для экспериментов с автоэнкодерами, вариационными
-автоэнкодерами и GAN'ами для русскогоязычных предложений.
+Подготовка датасета для экспериментов с автоэнкодерами и вариационными
+автоэнкодерами для русскогоязычных предложений.
 На входе используется файл со списком предложений.
 На выходе - два файла с векторизованными предложениями и словарь
 с соответствиями слов и векторов.
@@ -21,13 +21,20 @@ data_folder = '../data'
 # Текстовый файл с векторыми слов в word2vec формате, который может прочитать
 # gensim. Векторы слов отсюда используются для заполнения тензора с предложениями.
 #w2v_path = r'f:\Word2Vec\word_vectors_cbow=1_win=5_dim=32.txt'
-w2v_path = '/home/eek/polygon/w2v/w2v.CBOW=0_WIN=5_DIM=24.txt'
+w2v_path = '/home/eek/polygon/w2v/w2v.CBOW=0_WIN=5_DIM=8.txt'
 
 # Путь к файлу со списком фраз, на которых будет тренироваться модель.
 corpus_path = '../data/phrases.txt'
 
-# В датасет берем только предложения не длиннее заданного количества слов.
+# Минимальное и максимальное количество слов в предложениях, которые
+# будут векторизованы и попадут в датасет.
+MIN_SENT_LEN = 1
 MAX_SENT_LEN = 6
+
+# Обучение на полном наборе предложений может занять слишком много времени, это
+# делает эксперименты с архитектурой некомфортными. Поэтому будем ограничивать датасет
+# зданным числом фраз.
+MAX_NB_PHRASES = 10000000
 
 
 def decode_output(y, v2w):
@@ -73,7 +80,7 @@ if __name__ == '__main__':
     with codecs.open(corpus_path, 'r', 'utf-8') as rdr:
         for line in rdr:
             words = line.strip().split()
-            if len(words) <= MAX_SENT_LEN:
+            if MIN_SENT_LEN <= len(words) <= MAX_SENT_LEN:
                 all_words_known = True
                 for word in words:
                     if word not in w2v:
@@ -83,10 +90,11 @@ if __name__ == '__main__':
                 if all_words_known:
                     phrases.append(words)
                     all_words.update(words)
-                    #if len(phrases) >= 10000:
-                    #    break
+                    if len(phrases) >= MAX_NB_PHRASES:
+                        break
 
     nb_phrases = len(phrases)
+    print('nb_phrases={}'.format(nb_phrases))
 
     max_sent_len = max(map(len, phrases))
     print('max_sent_len={}'.format(max_sent_len))
@@ -117,13 +125,11 @@ if __name__ == '__main__':
     for phrase in probe_phrases:
         print(u'{}'.format(phrase))
 
-    # сохраним датасеты на диске
     print('Storing dataset...')
     with open('../data/vtexts.npz', 'wb') as f:
         np.savez_compressed(f, vtexts)
 
     with open('../data/word2vec.pkl', 'wb') as f:
         pickle.dump(word2vec, f)
-
 
 
