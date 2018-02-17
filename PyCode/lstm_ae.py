@@ -282,39 +282,29 @@ def v_cosine(v1, v2):
     return s
 
 
-def find_word_l2(word_vector, v2w):
+def find_word_l2(word_vector, words, vectors):
     """
     Поиск слова, максимально близкого к заданному вектору word_vector,
     с использованием евклидового расстояния.
     """
-    min_dist = 1e38
-    best_word = u''
-    for v, w in v2w:
-        d = np.linalg.norm(v - word_vector)
-        if d < min_dist:
-            min_dist = d
-            best_word = w
+    deltas = vectors - word_vector
+    l2 = np.linalg.norm(deltas, axis=-1)
+    imin = np.argmin(l2)
+    return words[imin]
 
-    return best_word
-
-
-def find_word_cos(word_vector, v2w):
-    """
-    Поиск слова, максимально близкого к заданному вектору word_vector,
-    с использованием косинусной близости.
-    """
-    max_sim = -1.0
-    best_word = u''
-    for v, w in v2w:
-        d = v_cosine(v, word_vector)
-        if d >= max_sim:
-            max_sim = d
-            best_word = w
-
-    return best_word
+    #min_dist = 1e38
+    #best_word = u''
+    #for v, w in v2w:
+    #    d = np.linalg.norm(v - word_vector)
+    #    if d < min_dist:
+    #        min_dist = d
+    #        best_word = w
+    #return best_word
 
 
-def decode_output(y, v2w):
+
+
+def decode_output(y, words, vectors):
     """
     Декодируем выходной тензор автоэнкодера, получаем читабельные
     предложения в том же порядке, как входные.
@@ -329,7 +319,7 @@ def decode_output(y, v2w):
             l2 = np.linalg.norm(word_vector)
             best_word = null_word
             if l2>0.1:
-                best_word = find_word_l2(word_vector, v2w)
+                best_word = find_word_l2(word_vector, words, vectors)
 
             phrase_words.append(best_word)
 
@@ -349,11 +339,12 @@ class colors:
 
 class VisualizeCallback(keras.callbacks.Callback):
 
-    def __init__(self, ae_model, X_data, v2w, batch_size):
+    def __init__(self, ae_model, X_data, words, vectors, batch_size):
         self.epoch = 0
         self.X_data = X_data
         self.model = ae_model
-        self.v2w = v2w
+        self.words = words
+        self.vectors = vectors
         self.batch_size = batch_size
 
     def on_epoch_end(self, batch, logs={}):
@@ -374,8 +365,8 @@ class VisualizeCallback(keras.callbacks.Callback):
         nb_errors = 0
 
         for iphrase in range(min(nb_max_tested,X_test.shape[0])):
-            input_phrase = decode_output(X_test[iphrase:iphrase+1], self.v2w)[0]
-            output_phrase = decode_output(y_test[iphrase:iphrase+1], self.v2w)[0]
+            input_phrase = decode_output(X_test[iphrase:iphrase+1], self.words, self.vectors)[0]
+            output_phrase = decode_output(y_test[iphrase:iphrase+1], self.words, self.vectors)[0]
 
             nb_tested += 1
             if input_phrase != output_phrase:
@@ -388,7 +379,7 @@ class VisualizeCallback(keras.callbacks.Callback):
                 print(u'{} ==> {}'.format(input_phrase, output_phrase))
 
         acc = float(nb_tested-nb_errors)/nb_tested
-        print('Per sample accuracy={}'.format(acc))
+        print('\nPer sample accuracy={}'.format(acc))
 
 # -----------------------------------------------------------
 
@@ -398,6 +389,7 @@ parser.add_argument('--estimate', default=0, type=int, help='estimate latent PDF
 parser.add_argument('--generate', default=0, type=int, help='use trained model and PDFs estimations for random text generation')
 parser.add_argument('--epochs', default=NB_EPOCHS, type=int, help='max number of epochs when training the model')
 parser.add_argument('--batch_size', default=32, type=int, help='size of minibatch when training the model')
+parser.add_argument('--latent_dim', default=64, type=int, help='length of encoder output vectors')
 
 args = parser.parse_args()
 
@@ -406,6 +398,7 @@ do_estimate_pdfs = args.estimate
 do_vizualize = args.generate
 nb_epochs = args.epochs
 batch_size = args.batch_size
+latent_dim = args.latent_dim
 
 # -----------------------------------------------------------
 
@@ -413,7 +406,12 @@ batch_size = args.batch_size
 with open(os.path.join(data_folder, 'word2vec.pkl'), 'r') as f:
     word2vec = pickle.load(f)
 
-v2w = [(v, w) for w, v in iteritems(word2vec)]
+#v2w = [(v, w) for w, v in iteritems(word2vec)]
+words = list(word2vec.keys())
+w2v_dim = len(word2vec[words[0]])
+vectors = np.zeros((len(words), w2v_dim))
+for i, word in enumerate(words):
+    vectors[i, :] = word2vec[words[i]]
 
 # -----------------------------------------------------------
 
@@ -474,7 +472,7 @@ if do_train:
                                        verbose=1, save_best_only=True, mode='auto')
     early_stopping = EarlyStopping(monitor=monitor_metric, patience=10, verbose=1, mode='auto')
 
-    viz = VisualizeCallback(ae_model, vtexts, v2w, batch_size)
+    viz = VisualizeCallback(ae_model, vtexts, words, vectors, batch_size)
 
     callbacks = [viz, model_checkpoint, early_stopping]
 
