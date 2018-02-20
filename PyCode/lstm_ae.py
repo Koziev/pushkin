@@ -18,6 +18,8 @@
 
 from __future__ import print_function, division
 
+from future.utils import iteritems
+
 import keras.callbacks
 from keras.callbacks import ModelCheckpoint, EarlyStopping
 from keras.layers import Conv1D
@@ -43,7 +45,7 @@ import json
 import os
 import argparse
 
-from future.utils import iteritems
+from word_decoder import W2V_Decoder
 
 
 # длина вектора на выходе кодирующей части автоэнкодера, фактически это
@@ -71,7 +73,7 @@ data_folder = '../data'
 model_folder = '../tmp'
 
 
-def create_ae(net_config, max_seq_len, word_dims, latent_dim):
+def create_ae(net_config, max_seq_len, word_dims, latent_dim, l1, l2):
     """
     Создается классический сжимающий автоэнкодер с архитектурой seq2seq для упаковки
     предложения в вектор фиксированного размера latent_dim.
@@ -108,10 +110,20 @@ def create_ae(net_config, max_seq_len, word_dims, latent_dim):
     elif net_config['encoder'] == 'lstm':
         encoder_final = recurrent.LSTM(latent_dim, return_sequences=False)(encoder_input)
 
-    encoder_final = Dense(units=int(latent_dim),
-                          activation='tanh',
-                          activity_regularizer = regularizers.l1(1e-5)
-                          )(encoder_final)
+    if l1 == 0.0 and l2 == 0.0:
+        encoder_final = Dense(units=int(latent_dim),
+                              activation='tanh',
+                              )(encoder_final)
+    elif l1 > 0.0 and l2 == 0.0:
+        encoder_final = Dense(units=int(latent_dim),
+                              activation='tanh',
+                              activity_regularizer=regularizers.l1(l1)
+                              )(encoder_final)
+    else:
+        encoder_final = Dense(units=int(latent_dim),
+                              activation='tanh',
+                              activity_regularizer=regularizers.l1l2(l1, l2)
+                              )(encoder_final)
 
     # декодер
     decoder = RepeatVector(max_seq_len)(encoder_final)
@@ -302,8 +314,6 @@ def find_word_l2(word_vector, words, vectors):
     #return best_word
 
 
-
-
 def decode_output(y, words, vectors):
     """
     Декодируем выходной тензор автоэнкодера, получаем читабельные
@@ -339,13 +349,13 @@ class colors:
 
 class VisualizeCallback(keras.callbacks.Callback):
 
-    def __init__(self, ae_model, X_data, words, vectors, batch_size):
+    def __init__(self, ae_model, X_data, w2v_decoder, batch_size):
         self.epoch = 0
         self.X_data = X_data
         self.model = ae_model
-        self.words = words
-        self.vectors = vectors
+        self.w2v_decoder = w2v_decoder
         self.batch_size = batch_size
+        self.instance_acc_hist = []
 
     def on_epoch_end(self, batch, logs={}):
         self.epoch = self.epoch+1
@@ -365,8 +375,8 @@ class VisualizeCallback(keras.callbacks.Callback):
         nb_errors = 0
 
         for iphrase in range(min(nb_max_tested,X_test.shape[0])):
-            input_phrase = decode_output(X_test[iphrase:iphrase+1], self.words, self.vectors)[0]
-            output_phrase = decode_output(y_test[iphrase:iphrase+1], self.words, self.vectors)[0]
+            input_phrase = self.w2v_decoder.decode_output(X_test[iphrase:iphrase+1])[0]
+            output_phrase = self.w2v_decoder.decode_output(y_test[iphrase:iphrase+1])[0]
 
             nb_tested += 1
             if input_phrase != output_phrase:
@@ -380,6 +390,12 @@ class VisualizeCallback(keras.callbacks.Callback):
 
         acc = float(nb_tested-nb_errors)/nb_tested
         print('\nPer sample accuracy={}'.format(acc))
+        self.instance_acc_hist.append(acc)
+
+    def save_instance_acc(self, filepath):
+        with open(filepath, 'w') as wrt:
+            for acc in self.instance_acc_hist:
+                wrt.write('{}\n'.format(acc))
 
 # -----------------------------------------------------------
 
@@ -390,6 +406,10 @@ parser.add_argument('--generate', default=0, type=int, help='use trained model a
 parser.add_argument('--epochs', default=NB_EPOCHS, type=int, help='max number of epochs when training the model')
 parser.add_argument('--batch_size', default=32, type=int, help='size of minibatch when training the model')
 parser.add_argument('--latent_dim', default=64, type=int, help='length of encoder output vectors')
+parser.add_argument('--l1', default=0.0, type=float, help='L1 regularization value, e.g. 1e-6')
+parser.add_argument('--l2', default=0.0, type=float, help='L2 regularization value, e.g. 1e-4')
+parser.add_argument('--arch', default='ae', type=str, help='"ae" or "vae"')
+
 
 args = parser.parse_args()
 
@@ -399,19 +419,14 @@ do_vizualize = args.generate
 nb_epochs = args.epochs
 batch_size = args.batch_size
 latent_dim = args.latent_dim
+l1 = args.l1
+l2 = args.l2
+NET_CONFIG['arch'] = args.arch
 
 # -----------------------------------------------------------
 
 # Словарь с парами слово-вектор для печати читабельных результатов
-with open(os.path.join(data_folder, 'word2vec.pkl'), 'r') as f:
-    word2vec = pickle.load(f)
-
-#v2w = [(v, w) for w, v in iteritems(word2vec)]
-words = list(word2vec.keys())
-w2v_dim = len(word2vec[words[0]])
-vectors = np.zeros((len(words), w2v_dim))
-for i, word in enumerate(words):
-    vectors[i, :] = word2vec[words[i]]
+w2v_decoder = W2V_Decoder(os.path.join(data_folder, 'word2vec.pkl'))
 
 # -----------------------------------------------------------
 
@@ -446,7 +461,11 @@ if do_train:
     # Создание нейросетки
 
     if NET_CONFIG['arch'] == 'ae':
-        ae_model, encoder_model, decoder_model = create_ae(NET_CONFIG, max_seq_len, w2v_dims, latent_dim)
+        ae_model, encoder_model, decoder_model = create_ae(NET_CONFIG,
+                                                           max_seq_len,
+                                                           w2v_dims,
+                                                           latent_dim,
+                                                           l1, l2)
     elif NET_CONFIG['arch'] == 'vae':
         ae_model, encoder_model, decoder_model = create_vae(NET_CONFIG, max_seq_len, w2v_dims, latent_dim, batch_size)
     else:
@@ -472,7 +491,7 @@ if do_train:
                                        verbose=1, save_best_only=True, mode='auto')
     early_stopping = EarlyStopping(monitor=monitor_metric, patience=10, verbose=1, mode='auto')
 
-    viz = VisualizeCallback(ae_model, vtexts, words, vectors, batch_size)
+    viz = VisualizeCallback(ae_model, vtexts, w2v_decoder, batch_size)
 
     callbacks = [viz, model_checkpoint, early_stopping]
 
@@ -492,6 +511,8 @@ if do_train:
                             verbose=1,
                             callbacks=callbacks,
                             )
+
+    viz.save_instance_acc(os.path.join(model_folder, 'instance_accuracy.l1={}.l2={}.dat'.format(l1, l2)))
 
     # Загружаем последние лучшие веса полной модели
     ae_model.load_weights(decoder_weights_path)
@@ -689,6 +710,6 @@ if do_vizualize:
     y_probe = decoder_model.predict(X_probe)
 
     # декодируем результаты работы модели
-    result_phrases = decode_output(y_probe, v2w)
+    result_phrases = w2v_decoder.decode_output(y_probe)
     for phrase in result_phrases:
         print(u'{}'.format(phrase))
